@@ -18,7 +18,8 @@ export class RabbitClient {
   constructor(url, replyQueueName) {
     this.url = url || "amqp://rabbitmq:5672";
     this.connection = null;
-    this.channel = null;
+    this.sendChannel = null;
+    this.recvChannel = null;
 
     this.#replyQueueName = replyQueueName || `rpc_reply_${randomUUID()}`;
   }
@@ -29,7 +30,8 @@ export class RabbitClient {
     while (retries > 0) {
       try {
         this.connection = await amqp.connect(this.url);
-        this.channel = await this.connection.createChannel();
+        this.sendChannel = await this.connection.createConfirmChannel();
+        this.recvChannel = await this.connection.createChannel();
         this._registerConnectionHandlers();
         if (opt.isFirstTimeInit) {
           this.#isConnectionReady = true; // connection ready is fired later for reconnect
@@ -58,7 +60,7 @@ export class RabbitClient {
 
     const sendMessage = () => {
       try {
-        this.channel.publish(exchange, routingKey, payload, mergedOptions);
+        this.sendChannel.publish(exchange, routingKey, payload, mergedOptions);
       } catch (err) {
         console.error("Publish failed:", err.message);
         this.#offlineQueue.push({
@@ -102,7 +104,12 @@ export class RabbitClient {
 
       const sendMessage = () => {
         try {
-          this.channel.publish(exchange, routingKey, payload, mergedOptions);
+          this.sendChannel.publish(
+            exchange,
+            routingKey,
+            payload,
+            mergedOptions
+          );
         } catch (err) {
           this.#offlineQueue.push({
             type: "rpc-request",
@@ -154,14 +161,14 @@ export class RabbitClient {
         return;
       }
 
-      this.channel.sendToQueue(replyTo, payload, mergedOptions);
+      this.sendChannel.sendToQueue(replyTo, payload, mergedOptions);
     } catch (err) {
       console.error("RPC response error:", err.message);
     }
   }
 
   async consume(queue, handler) {
-    if (!this.channel) throw new Error("Channel not initialized");
+    if (!this.recvChannel) throw new Error("Channel not initialized");
 
     if (!this.#recoveryConsumers.has(queue))
       this.#recoveryConsumers.set(queue, []);
@@ -171,7 +178,7 @@ export class RabbitClient {
   }
 
   async assertExchange(exchange, type = "topic", options = { durable: true }) {
-    await this.channel.assertExchange(exchange, type, options);
+    await this.recvChannel.assertExchange(exchange, type, options);
 
     if (!this.#recoveryExchanges.has(exchange))
       this.#recoveryExchanges.set(exchange, []);
@@ -179,14 +186,14 @@ export class RabbitClient {
   }
 
   async assertQueue(queue, options = { durable: true }) {
-    await this.channel.assertQueue(queue, options);
+    await this.recvChannel.assertQueue(queue, options);
 
     if (!this.#recoveryQueues.has(queue)) this.#recoveryQueues.set(queue, []);
     this.#recoveryQueues.get(queue).push({ options });
   }
 
   async bindQueue(queue, exchange, routingKey) {
-    await this.channel.bindQueue(queue, exchange, routingKey);
+    await this.recvChannel.bindQueue(queue, exchange, routingKey);
 
     if (!this.#recoveryBindings.has(queue))
       this.#recoveryBindings.set(queue, []);
@@ -258,7 +265,7 @@ export class RabbitClient {
   async _restoreTopologyExchanges() {
     for (const [exchange, list] of this.#recoveryExchanges) {
       for (const ex of list) {
-        await this.channel.assertExchange(exchange, ex.type, ex.options);
+        await this.recvChannel.assertExchange(exchange, ex.type, ex.options);
       }
     }
   }
@@ -266,13 +273,13 @@ export class RabbitClient {
   async _restoreTopologyQueues() {
     for (const [queue, list] of this.#recoveryQueues) {
       for (const q of list) {
-        await this.channel.assertQueue(queue, q.options);
+        await this.recvChannel.assertQueue(queue, q.options);
       }
     }
 
     for (const [queue, binds] of this.#recoveryBindings) {
       for (const b of binds) {
-        await this.channel.bindQueue(queue, b.exchange, b.routingKey);
+        await this.recvChannel.bindQueue(queue, b.exchange, b.routingKey);
       }
     }
   }
@@ -290,9 +297,9 @@ export class RabbitClient {
       const msg = this.#offlineQueue.shift();
       try {
         if (msg.type === "rpc-response") {
-          this.channel.sendToQueue(msg.replyTo, msg.payload, msg.options);
+          this.sendChannel.sendToQueue(msg.replyTo, msg.payload, msg.options);
         } else {
-          this.channel.publish(
+          this.sendChannel.publish(
             msg.exchange,
             msg.routingKey,
             msg.payload,
@@ -308,7 +315,7 @@ export class RabbitClient {
   }
 
   async _consume(queue, handler) {
-    await this.channel.consume(
+    await this.recvChannel.consume(
       queue,
       async (msg) => {
         if (!msg) return;
@@ -316,10 +323,10 @@ export class RabbitClient {
           const content = JSON.parse(msg.content.toString());
           await handler(content, msg, queue);
 
-          this.channel.ack(msg);
+          this.recvChannel.ack(msg);
         } catch (err) {
           console.error("Message handler error:", err);
-          this.channel.nack(msg, false, true);
+          this.recvChannel.nack(msg, false, true);
         }
       },
       { noAck: false }
