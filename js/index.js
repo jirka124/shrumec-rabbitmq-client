@@ -54,42 +54,40 @@ export class RabbitClient extends EventEmitter {
     throw new Error("Could not connect to RabbitMQ after multiple attempts");
   }
 
-  publish(exchange, routingKey, message, options) {
+  async publish(exchange, routingKey, message, options = {}, timeout = null) {
     const payload = Buffer.from(JSON.stringify(message));
-    const mergedOptions = {
-      persistent: true,
-      ...options,
+    const mergedOptions = { persistent: true, ...options };
+
+    const track = this._trackPublish(timeout);
+
+    const msg = {
+      type: "publish",
+      exchange,
+      routingKey,
+      payload,
+      options: mergedOptions,
+      extra: {
+        track,
+      },
     };
 
-    const sendMessage = () => {
-      try {
-        this.sendChannel.publish(exchange, routingKey, payload, mergedOptions);
-      } catch (err) {
-        console.error("Publish failed:", err.message);
-        this.#offlineQueue.push({
-          exchange,
-          routingKey,
-          payload,
-          options: mergedOptions,
-        });
-      }
-    };
-
-    if (this.#isConnectionReady) sendMessage();
-    else {
-      this.#offlineQueue.push({
-        exchange,
-        routingKey,
-        payload,
-        options: mergedOptions,
-      });
-    }
+    if (!this.#isConnectionReady) this.#offlineQueue.push(msg);
+    else this._publishConfirm(msg);
+    return track.promise;
   }
 
-  publishRPC(exchange, routingKey, message, options, timeout = 60000) {
-    return new Promise((resolve, reject) => {
+  publishRPC(
+    exchange,
+    routingKey,
+    message,
+    options,
+    publishTimeout = null,
+    rpcTimeout = 60000
+  ) {
+    return new Promise(async (resolve, reject) => {
       const correlationId = randomUUID();
       const payload = Buffer.from(JSON.stringify(message));
+      const track = this._trackPublish(publishTimeout);
 
       const mergedOptions = {
         persistent: true,
@@ -98,76 +96,63 @@ export class RabbitClient extends EventEmitter {
         replyTo: this.#replyQueueName,
       };
 
+      const msg = {
+        type: "rpc-request",
+        exchange,
+        routingKey,
+        payload,
+        options: mergedOptions,
+        extra: {
+          track,
+        },
+      };
+
       const timer = setTimeout(() => {
         this.#pendingRPC.delete(correlationId);
         reject(new Error("RPC timeout"));
-      }, timeout);
+      }, rpcTimeout);
 
       this.#pendingRPC.set(correlationId, { resolve, reject, timer });
 
-      const sendMessage = () => {
-        try {
-          this.sendChannel.publish(
-            exchange,
-            routingKey,
-            payload,
-            mergedOptions
-          );
-        } catch (err) {
-          this.#offlineQueue.push({
-            type: "rpc-request",
-            exchange,
-            routingKey,
-            payload,
-            options: mergedOptions,
-          });
-        }
-      };
+      if (!this.#isConnectionReady) this.#offlineQueue.push(msg);
+      else this._publishConfirm(msg);
 
-      if (this.#isConnectionReady) sendMessage();
-      else {
-        this.#offlineQueue.push({
-          type: "rpc-request",
-          exchange,
-          routingKey,
-          payload,
-          options: mergedOptions,
-        });
-      }
+      track.promise.catch((err) => {
+        this.#pendingRPC.delete(correlationId);
+        clearTimeout(timer);
+        reject(err);
+      });
     });
   }
 
-  async answerRPC(ctx, data, options) {
-    try {
-      const replyTo = ctx?.properties?.replyTo;
-      const correlationId = ctx?.properties?.correlationId;
+  async answerRPC(ctx, data, options = {}, timeout = null) {
+    const replyTo = ctx?.properties?.replyTo;
+    const correlationId = ctx?.properties?.correlationId;
 
-      if (!replyTo || !correlationId) {
-        console.warn("RPC reply skipped: missing replyTo or correlationId");
-        return;
-      }
-
-      const payload = Buffer.from(JSON.stringify(data));
-      const mergedOptions = {
-        persistent: true,
-        ...options,
-        correlationId,
-      };
-
-      if (!this.#isConnectionReady) {
-        this.#offlineQueue.push({
-          type: "rpc-response",
-          replyTo,
-          payload,
-          options: mergedOptions,
-        });
-        return;
-      }
-
-      this.sendChannel.sendToQueue(replyTo, payload, mergedOptions);
-    } catch (err) {
-      console.error("RPC response error:", err.message);
+    if (!replyTo || !correlationId) {
+      console.warn("RPC reply skipped: no replyTo/correlationId");
+      return;
     }
+
+    const payload = Buffer.from(JSON.stringify(data));
+    const mergedOptions = { persistent: true, correlationId, ...options };
+
+    const track = this._trackPublish(timeout);
+
+    const msg = {
+      type: "rpc-response",
+      exchange: "",
+      routingKey: replyTo,
+      payload,
+      options: mergedOptions,
+      extra: {
+        track,
+      },
+    };
+
+    if (!this.#isConnectionReady) this.#offlineQueue.push(msg);
+    else this._publishConfirm(msg);
+    return track.promise;
   }
 
   async consume(queue, handler) {
@@ -211,15 +196,56 @@ export class RabbitClient extends EventEmitter {
     });
   }
 
+  async _publishConfirm(msg) {
+    const { resolve, reject, timer } = msg.extra.track;
+    this.sendChannel.publish(
+      msg.exchange,
+      msg.routingKey,
+      msg.payload,
+      msg.options,
+      (err) => {
+        if (timer) clearTimeout(timer);
+
+        if (err) reject(err);
+        else resolve(true);
+      }
+    );
+  }
+
+  _trackPublish(timeout) {
+    const id = randomUUID();
+
+    let resolve;
+    let reject;
+    let timer = null;
+
+    const promise = new Promise((res, rej) => {
+      resolve = res;
+      reject = rej;
+
+      if (timeout && timeout > 0) {
+        timer = setTimeout(() => {
+          reject(new Error("Publish timeout"));
+        }, timeout);
+      }
+    });
+
+    return {
+      id,
+      promise,
+      resolve,
+      reject,
+      timer,
+    };
+  }
+
   _startAutoFlusher(intervalMs = this.#OFFLINE_FLUSH_INTERVAL) {
     if (this.#flusherTimer) clearInterval(this.#flusherTimer);
     this.#flusherTimer = setInterval(async () => {
-      if (this.#isConnectionReady && this.#offlineQueue.length > 0) {
-        try {
-          await this._flushOfflineQueue();
-        } catch (err) {
-          console.warn("Auto flush failed:", err.message);
-        }
+      try {
+        await this._flushOfflineQueue();
+      } catch (err) {
+        console.warn("Auto flush failed:", err.message);
       }
     }, intervalMs);
   }
@@ -307,40 +333,28 @@ export class RabbitClient extends EventEmitter {
   }
 
   async _flushOfflineQueue() {
-    const initialLength = this.#offlineQueue.length;
+    if (!this.#isConnectionReady || this.#offlineQueue.length === 0) return;
 
-    for (let i = 0; i < initialLength; i++) {
+    const size = this.#offlineQueue.length;
+
+    for (let i = 0; i < size; i++) {
       const msg = this.#offlineQueue.shift();
-      try {
-        if (msg.type === "rpc-response") {
-          this.sendChannel.sendToQueue(msg.replyTo, msg.payload, msg.options);
-        } else {
-          this.sendChannel.publish(
-            msg.exchange,
-            msg.routingKey,
-            msg.payload,
-            msg.options
-          );
-        }
-      } catch (err) {
-        console.error("Failed to flush queued message:", err.message);
-        this.#offlineQueue.push(msg);
-      }
+      this._publishConfirm(msg);
     }
 
-    if (initialLength && !this.#offlineQueue.length)
+    if (size > 0 && this.#offlineQueue.length === 0) {
       this._emit("offline-queue-flushed", {});
+    }
   }
 
   async _consume(queue, handler) {
     await this.recvChannel.consume(
       queue,
       async (msg) => {
-        if (!msg) return;
+        if (!msg) throw new Error("msg undefined");
         try {
           const content = JSON.parse(msg.content.toString());
           await handler(content, msg, queue);
-
           this.recvChannel.ack(msg);
         } catch (err) {
           console.error("Message handler error:", err);

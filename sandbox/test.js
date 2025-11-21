@@ -34,10 +34,10 @@ const consumeFunction = async (content, ctx, queue) => {
     await rabbit1.assertExchange(EXCHANGE, "topic", { durable: true });
     await rabbit2.assertExchange(EXCHANGE, "topic", { durable: true });
 
-    await rabbit1.assertQueue(QUEUE_1, { durable: false });
-    await rabbit1.assertQueue(QUEUE_2, { durable: false });
-    await rabbit2.assertQueue(QUEUE_1, { durable: false });
-    await rabbit2.assertQueue(QUEUE_3, { durable: false });
+    await rabbit1.assertQueue(QUEUE_1, { durable: true });
+    await rabbit1.assertQueue(QUEUE_2, { durable: true });
+    await rabbit2.assertQueue(QUEUE_1, { durable: true });
+    await rabbit2.assertQueue(QUEUE_3, { durable: true });
 
     await rabbit1.bindQueue(QUEUE_1, EXCHANGE, "sandbox"); // load-balance any sandbox
     await rabbit1.bindQueue(QUEUE_2, EXCHANGE, "sandbox.1"); // unique direct queue
@@ -93,8 +93,15 @@ const consumeFunction = async (content, ctx, queue) => {
     await closePromise;
 
     console.log("Sending offline messages");
-    rabbit1.publish(EXCHANGE, "sandbox.2", {
+    const waitForSendPublish = rabbit1.publish(EXCHANGE, "sandbox.2", {
       message: "From sandbox-1 to sandbox-2 while offline",
+    });
+    waitForSendPublish.then((val) => {
+      console.log(
+        "waitForSendPublish RESOLVED WITH: ",
+        val,
+        waitForSendPublish
+      );
     });
 
     reqParams = {
@@ -104,7 +111,7 @@ const consumeFunction = async (content, ctx, queue) => {
     };
 
     const offlineRPCPromise = rabbit1
-      .publishRPC(EXCHANGE, "sandbox.2", reqParams, {}, 1200000)
+      .publishRPC(EXCHANGE, "sandbox.2", reqParams, {}, null, 30000)
       .then((res) =>
         console.log(
           `RPC returned after offline (${reqParams.op1} + ${reqParams.op2}) = ${res.result}`
